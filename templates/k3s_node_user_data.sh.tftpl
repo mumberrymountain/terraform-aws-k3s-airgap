@@ -1,0 +1,170 @@
+#!/bin/bash
+# k3s air-gap bootstrap for a private node (role: ${role}).
+# The node never talks to the internet: every artifact comes from the
+# NAT instance's artifact server inside the VPC.
+set -euo pipefail
+exec > >(tee -a /var/log/k3s-airgap-bootstrap.log) 2>&1
+
+ARTIFACT_URL="${artifact_url}"
+WORK_DIR=/opt/k3s-airgap
+
+################################################################################
+# Time sync
+################################################################################
+
+# Air-gapped hosts cannot reach public NTP pools; use the Amazon Time Sync
+# Service (link-local) so TLS certificates issued by k3s stay valid.
+if [ -d /etc/chrony ]; then
+  install -d /etc/chrony/sources.d
+  echo "server 169.254.169.123 prefer iburst minpoll 4 maxpoll 4" > /etc/chrony/sources.d/aws-time-sync.sources
+  chronyc reload sources || systemctl restart chrony || true
+fi
+
+################################################################################
+# Disk growth limits
+################################################################################
+
+# journald (k3s, containerd and kubelet log here through systemd): cap total size and age.
+install -d /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/00-airgap.conf <<'JOURNALDEOF'
+[Journal]
+SystemMaxUse=500M
+SystemKeepFree=2G
+SystemMaxFileSize=50M
+MaxRetentionSec=2week
+JOURNALDEOF
+systemctl restart systemd-journald
+
+# rsyslog copies of the journal (/var/log/syslog etc.) only rotate weekly by default;
+# also rotate them once they exceed 100M.
+if [ -f /etc/logrotate.d/rsyslog ] && ! grep -q maxsize /etc/logrotate.d/rsyslog; then
+  sed -i -E 's/^(\s*)(daily|weekly)$/\1\2\n\1maxsize 100M/' /etc/logrotate.d/rsyslog
+fi
+
+# Files k3s and this script write outside of journald and kubelet's own rotation.
+cat > /etc/logrotate.d/k3s <<'LOGROTATEEOF'
+/var/lib/rancher/k3s/agent/containerd/containerd.log
+/var/log/k3s-airgap-bootstrap.log
+{
+  daily
+  rotate 7
+  maxsize 50M
+  missingok
+  notifempty
+  compress
+  delaycompress
+  copytruncate
+}
+LOGROTATEEOF
+
+# Run logrotate hourly so the maxsize limits take effect between daily runs.
+install -d /etc/systemd/system/logrotate.timer.d
+cat > /etc/systemd/system/logrotate.timer.d/hourly.conf <<'TIMEREOF'
+[Timer]
+OnCalendar=
+OnCalendar=hourly
+AccuracySec=1m
+TIMEREOF
+systemctl daemon-reload
+systemctl restart logrotate.timer
+
+################################################################################
+# SSH hardening
+################################################################################
+
+# sshd uses the first value it reads, so this file must sort before 50-cloud-init.conf.
+install -d -m 0755 /run/sshd
+cat > /etc/ssh/sshd_config.d/01-airgap-hardening.conf <<'SSHDEOF'
+PermitRootLogin no
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+AuthenticationMethods publickey
+AllowUsers ${ssh_user}
+MaxAuthTries 3
+MaxSessions 5
+LoginGraceTime 30
+ClientAliveInterval 300
+ClientAliveCountMax 2
+TCPKeepAlive no
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding no
+AllowStreamLocalForwarding no
+PermitTunnel no
+PermitUserEnvironment no
+SSHDEOF
+chmod 600 /etc/ssh/sshd_config.d/01-airgap-hardening.conf
+if sshd -t; then
+  systemctl try-reload-or-restart ssh.service || true
+else
+  echo "sshd hardening config failed validation; removing it." >&2
+  rm -f /etc/ssh/sshd_config.d/01-airgap-hardening.conf
+fi
+
+# Log out idle interactive shells after 15 minutes.
+cat > /etc/profile.d/99-tmout.sh <<'TMOUTEOF'
+TMOUT=900
+readonly TMOUT
+export TMOUT
+TMOUTEOF
+
+################################################################################
+# Host firewall (ufw)
+################################################################################
+
+if command -v ufw >/dev/null 2>&1; then
+  ufw default deny incoming
+  ufw default allow outgoing
+  ufw default deny routed
+  ufw allow 22/tcp comment 'SSH'
+  ufw allow from ${private_subnet_cidr} comment 'k3s nodes'
+  ufw allow from ${nat_private_ip} to any port 6443 proto tcp comment 'k3s API from NAT instance'
+  ufw allow from ${pod_cidr} comment 'k3s pods'
+  ufw allow from ${service_cidr} comment 'k3s services'
+  ufw route allow from ${pod_cidr} comment 'k3s pod traffic'
+  ufw route allow to ${pod_cidr} comment 'k3s pod traffic'
+  ufw --force enable
+else
+  echo "ufw not found; skipping host firewall." >&2
+fi
+
+################################################################################
+# k3s air-gap install
+################################################################################
+
+echo "Waiting for artifact server at $ARTIFACT_URL ..."
+for attempt in $(seq 1 180); do
+  if curl -fsS -o /dev/null "$ARTIFACT_URL/READY"; then
+    break
+  fi
+  if [ "$attempt" -eq 180 ]; then
+    echo "Artifact server did not become ready in time." >&2
+    exit 1
+  fi
+  sleep 10
+done
+
+install -d "$WORK_DIR"
+cd "$WORK_DIR"
+for file in k3s install.sh ${images_file_name} sha256sum-${arch}.txt; do
+  curl -fsS --retry 5 -o "$file" "$ARTIFACT_URL/$file"
+done
+sha256sum -c --ignore-missing sha256sum-${arch}.txt
+
+install -m 0755 k3s /usr/local/bin/k3s
+install -d /var/lib/rancher/k3s/agent/images
+install -m 0644 ${images_file_name} /var/lib/rancher/k3s/agent/images/
+
+install -d -m 0755 /etc/rancher/k3s
+cat > /etc/rancher/k3s/config.yaml <<'CONFIGEOF'
+${config_yaml}
+CONFIGEOF
+chmod 600 /etc/rancher/k3s/config.yaml
+
+INSTALL_K3S_SKIP_DOWNLOAD=true INSTALL_K3S_EXEC="${role}" sh install.sh
+
+# The binary and image tarball are already installed; drop the downloaded copies.
+cd /
+rm -rf "$WORK_DIR"

@@ -1,0 +1,61 @@
+#!/bin/bash
+set -euxo pipefail
+
+%{ if deploy_ssh_key ~}
+install -d -m 700 -o ${nat_ssh_user} -g ${nat_ssh_user} /home/${nat_ssh_user}/.ssh
+
+cat > /home/${nat_ssh_user}/.ssh/id_airgap.pem <<'KEYEOF'
+${private_key_pem}
+KEYEOF
+chmod 400 /home/${nat_ssh_user}/.ssh/id_airgap.pem
+chown ${nat_ssh_user}:${nat_ssh_user} /home/${nat_ssh_user}/.ssh/id_airgap.pem
+
+cat > /home/${nat_ssh_user}/.ssh/config <<'SSHEOF'
+%{ for idx, ip in private_host_ips ~}
+Host private-${idx + 1}
+  HostName ${ip}
+  User ${private_ssh_user}
+  IdentityFile ~/.ssh/id_airgap.pem
+  StrictHostKeyChecking accept-new
+
+%{ endfor ~}
+SSHEOF
+chmod 600 /home/${nat_ssh_user}/.ssh/config
+chown ${nat_ssh_user}:${nat_ssh_user} /home/${nat_ssh_user}/.ssh/config
+%{ endif ~}
+
+# Stage k3s air-gap artifacts and serve them to the private subnet only
+# (the NAT security group restricts the port to private_subnet_cidr).
+ARTIFACT_DIR=/srv/k3s-airgap
+STAGING_DIR=$(mktemp -d)
+RELEASE_URL="https://github.com/k3s-io/k3s/releases/download/${k3s_version_url}"
+
+cd "$STAGING_DIR"
+for file in k3s ${k3s_images_file_name} sha256sum-${k3s_arch}.txt; do
+  curl -fsSL --retry 10 --retry-delay 5 -o "$file" "$RELEASE_URL/$file"
+done
+curl -fsSL --retry 10 --retry-delay 5 -o install.sh "https://raw.githubusercontent.com/k3s-io/k3s/${k3s_version_url}/install.sh"
+sha256sum -c --ignore-missing sha256sum-${k3s_arch}.txt
+
+install -d -m 0755 "$ARTIFACT_DIR"
+install -m 0644 k3s install.sh ${k3s_images_file_name} sha256sum-${k3s_arch}.txt "$ARTIFACT_DIR/"
+touch "$ARTIFACT_DIR/READY"
+cd /
+rm -rf "$STAGING_DIR"
+
+cat > /etc/systemd/system/k3s-artifacts.service <<'UNITEOF'
+[Unit]
+Description=k3s air-gap artifact server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 -m http.server ${k3s_artifact_port} --directory /srv/k3s-airgap
+Restart=always
+DynamicUser=yes
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+systemctl daemon-reload
+systemctl enable --now k3s-artifacts.service
